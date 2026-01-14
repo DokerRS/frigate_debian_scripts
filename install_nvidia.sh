@@ -16,6 +16,8 @@
 
 set -e
 
+trap abort SIGINT SIGTERM ERR
+
 # Check for root privileges
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script must be run as root. Use: sudo bash $0"
@@ -51,9 +53,53 @@ prompt_restart_docker() {
     esac
 }
 
+abort() {
+    echo "Script interrupted or failed."
+    unmask_docker || true
+    exit 1
+}
+
+stop_docker_if_running() {
+    if command -v docker >/dev/null 2>&1; then
+        containers="$(docker ps -q 2>/dev/null || true)"
+        if [ -n "${containers:-}" ]; then
+            echo "Stopping Docker containers..."
+            docker stop $containers >/dev/null 2>&1 || true
+        fi
+    fi
+
+    if systemctl is-active --quiet docker 2>/dev/null; then
+        echo "Stopping Docker service..."
+        systemctl stop docker >/dev/null 2>&1 || true
+    fi
+
+    echo "Masking Docker service..."
+    systemctl mask docker >/dev/null 2>&1 || true
+}
+
+unmask_docker() {
+    echo "Unmasking Docker service..."
+    systemctl unmask docker >/dev/null 2>&1 || true
+}
+
+ensure_base_tools() {
+    apt update -y
+    apt install -y --no-install-recommends ca-certificates curl gpg jq dkms
+}
+
 # Function to fetch latest production branch version
 fetch_latest_version() {
-    curl -s https://www.nvidia.com/en-us/drivers/unix/ | grep -oP 'Latest Production Branch Version:</span>\s*<a href="[^"]*">\s*\K[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1
+
+    local PROD_BRANCH='Latest Production Branch Version'
+    local NEW_FEATURE_BRANCH='Latest New Feature Branch Version'
+    local BETA_BRANCH='Latest Beta Version'
+    
+    local regex="${PROD_BRANCH}:</span>\\s*<a href=\\\"[^\\\"]*\\\">\\s*\\K[0-9]+\\.[0-9]+(\\.[0-9]+)?"
+
+    # Fetch the page and extract the first matching version number.
+    curl -s https://www.nvidia.com/en-us/drivers/unix/ \
+        | grep -oP "$regex" \
+        | head -n 1
 }
 
 # Function to get installed version
@@ -106,14 +152,18 @@ status() {
     fi
 
     # Docker GPU test with versions and GPU info
-    docker_version_output=$(docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu24.04 nvidia-smi --version 2>&1 || echo "failed")
-    if [ "$docker_version_output" = "failed" ]; then
-        echo "Docker GPU test failed."
-        status_failed=true
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        docker_version_output=$(docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu24.04 nvidia-smi --version 2>&1 || echo "failed")
+        if [ "$docker_version_output" = "failed" ]; then
+            echo "Docker GPU test failed."
+            status_failed=true
+        else
+            docker_gpu_name=$(docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu24.04 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | head -1)
+            echo "DOCKER: GPU: $docker_gpu_name"
+            echo "$docker_version_output" | sed 's/^/DOCKER: /'
+        fi
     else
-        docker_gpu_name=$(docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu24.04 nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | head -1)
-        echo "DOCKER: GPU: $docker_gpu_name"
-        echo "$docker_version_output" | sed 's/^/DOCKER: /'
+        echo "Docker not available/running; skipping Docker GPU test."
     fi
 
     if [ "$status_failed" = true ]; then
@@ -127,6 +177,8 @@ show_version() {
 }
 
 uninstall() {
+    ensure_base_tools
+
     if [ -n "$2" ]; then
         DRIVER_VERSION="$2"
     else
@@ -144,7 +196,7 @@ uninstall() {
     echo "Uninstalling NVIDIA Container Toolkit..."
     apt purge -y nvidia-container-toolkit || true
     rm -f /etc/apt/sources.list.d/nvidia-container-toolkit.list
-    rm -f /etc/apt/sources.list.d/non-free-firmware.list
+    #rm -f /etc/apt/sources.list.d/non-free-firmware.list
     apt update
 
     if [ -n "$DRIVER_VERSION" ]; then
@@ -156,7 +208,7 @@ uninstall() {
             cd /tmp
             if [ ! -f "$DRIVER_FILE" ]; then
                 echo "Driver installer not found in /tmp. Downloading it..."
-                curl -O "$DOWNLOAD_URL" || { echo "Failed to download installer."; exit 1; }
+                curl -fSLO "$DOWNLOAD_URL" || { echo "Failed to download installer."; exit 1; }
             fi
             chmod +x "$DRIVER_FILE"
             ./"$DRIVER_FILE" --uninstall --silent || true
@@ -179,8 +231,17 @@ uninstall() {
 
     # Revert Docker configuration
     if [ -f /etc/docker/daemon.json ]; then
-        sed -i '/"runtimes": { "nvidia": {/d' /etc/docker/daemon.json
-        sed -i '/"default-runtime": "nvidia"/d' /etc/docker/daemon.json
+        if jq -e . >/dev/null 2>&1 </etc/docker/daemon.json; then
+            tmp="$(mktemp)"
+            jq '
+            if has("runtimes") and (.runtimes | has("nvidia")) then
+                .runtimes |= (del(.nvidia) | (if (keys | length)==0 then empty else . end))
+            else . end
+            | if has("default-runtime") and ."default-runtime"=="nvidia" then del(."default-runtime") else . end
+            ' /etc/docker/daemon.json >"$tmp" && mv "$tmp" /etc/docker/daemon.json
+        else
+            echo "Warning: /etc/docker/daemon.json is not valid JSON; not modifying."
+        fi
     fi
 
     # Clean up
@@ -200,9 +261,10 @@ EOF
     prompt_reboot
 }
 
-# Function to check prerequisites
-check_prerequisites() {
-    if grep -E '^deb .*non-free-firmware' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null; then
+# Function to check install prerequisites
+check_install_prerequisites() {
+    # If any APT source already includes non-free-firmware, we're done.
+    if grep -E '^deb .*non-free-firmware' /etc/apt/sources.list /etc/apt/sources.list.d/* >/dev/null 2>&1; then
         return 0
     fi
 
@@ -220,45 +282,57 @@ check_prerequisites() {
         codename="stable"
     fi
 
-    new_source="deb http://deb.debian.org/debian $codename non-free-firmware"
-    echo "Created: /etc/apt/sources.list.d/non-free-firmware.list"
-    echo "With content: $new_source"
-
-    echo "$new_source" | tee /etc/apt/sources.list.d/non-free-firmware.list > /dev/null || {
-        echo "Failed to write sources list."; exit 1;
-    }
-    apt update || {
-        echo "Failed to run apt update after adding sources."; exit 1;
-    }
-    echo "non-free-firmware repository added successfully."
+    new_source="deb http://deb.debian.org/debian $codename main contrib non-free-firmware"
+    echo "$new_source" | tee /etc/apt/sources.list.d/non-free-firmware.list >/dev/null
+    apt update
 }
 
 install_driver() {
-    check_prerequisites
+    ensure_base_tools
+    check_install_prerequisites
 
     # Check if kernel headers package exists
     if ! apt-cache show "linux-headers-$(uname -r)" >/dev/null 2>&1; then
         echo "Error: Kernel headers for $(uname -r) not found in repository."
         exit 1
     fi
-    apt install -y linux-headers-$(uname -r) build-essential pkg-config libglvnd-dev firmware-misc-nonfree gpg
+    apt install -y  --no-install-recommends \
+        linux-headers-$(uname -r) build-essential pkg-config libglvnd-dev firmware-misc-nonfree
 
     DRIVER_VERSION=$(fetch_latest_version)
     if [ -z "$DRIVER_VERSION" ]; then
         read -p "Failed to fetch latest version. Enter driver version (default: 570.181): " user_input
         DRIVER_VERSION="${user_input:-570.181}"
     fi
+
+    installed="$(get_installed_version || true)"
+    if [ "$installed" = "$DRIVER_VERSION" ]; then
+        echo "Already on NVIDIA driver: $installed"
+        return 0
+    elif [ -n "$installed" ]; then
+        echo "Different NVIDIA driver version detected: $installed"
+        echo "Uninstalling existing version before proceeding..."
+        
+        stop_docker_if_running
+
+        if [ -f /usr/bin/nvidia-uninstall ]; then
+            echo "Using existing nvidia-uninstall tool..."
+            /usr/bin/nvidia-uninstall --silent || true
+        fi
+    fi
+
     DRIVER_FILE="NVIDIA-Linux-x86_64-${DRIVER_VERSION}.run"
     DOWNLOAD_URL="https://us.download.nvidia.com/XFree86/Linux-x86_64/${DRIVER_VERSION}/${DRIVER_FILE}"
 
     # Post-reboot steps (installation forward)
-    # Stop display manager
-    systemctl stop display-manager || telinit 3 || true
+    if systemctl list-unit-files --type=service 2>/dev/null | awk '{print $1}' | grep -qx "display-manager.service"; then
+        systemctl stop display-manager || true
+    fi
 
     # Download and install NVIDIA driver
     cd /tmp
     if [ ! -f "$DRIVER_FILE" ]; then
-        curl -O "$DOWNLOAD_URL"
+        curl -fSLO "$DOWNLOAD_URL"
     fi
     chmod +x "$DRIVER_FILE"
     ./"$DRIVER_FILE" --silent --dkms --no-x-check --no-nouveau-check --disable-nouveau
@@ -288,6 +362,7 @@ EOF
     # Clean up
     rm -f "$DRIVER_FILE"
 
+    unmask_docker
     echo "Installation complete."
     prompt_reboot
 }
@@ -302,35 +377,64 @@ install() {
 }
 
 rebuild() {
+    ensure_base_tools
+
+    apt update
     apt install -y linux-headers-$(uname -r) || {
         echo "Error: Failed to install linux-headers-$(uname -r)"
         exit 1
     }
-
+    
     version=$(get_installed_version)
     if [ -z "$version" ]; then
         echo "Error: No NVIDIA driver installed."
         exit 1
     fi
 
-    echo "Rebuilding NVIDIA DKMS module..."
-    dkms install --force -m nvidia -v "$version" -k $(uname -r) || {
-        echo "Error: Failed to rebuild NVIDIA DKMS module."
-        exit 1
-    }
+    echo "Detected NVIDIA version: $version"
+    echo
+    
+    echo "Cleaning stale NVIDIA DKMS versions (keeping $version)..."
+    dkms status 2>/dev/null | awk -F'[, ]+' '/^nvidia\//{print $1}' | cut -d/ -f2 | sort -u | while read -r v; do
+        [ -z "$v" ] && continue
+        if [ "$v" != "$version" ]; then
+            echo "  Removing stale DKMS entry: nvidia/$v"
+            dkms remove -m nvidia -v "$v" --all || true
+        fi
+    done
+    echo
+
+    echo "Rebuilding NVIDIA DKMS modules for kernel $(uname -r)..."
+
+ # Preferred path: let DKMS build what the system expects for this kernel.
+    if dkms autoinstall -k "$(uname -r)"; then
+        echo "DKMS autoinstall succeeded."
+    else
+        echo "DKMS autoinstall failed; attempting dkms reinstall for nvidia/$version..."
+        # reinstall is generally safer than install --force when state is messy
+        dkms reinstall -m nvidia -v "$version" -k "$(uname -r)" || {
+            echo "Error: dkms reinstall failed."
+            echo "Tip: check /var/lib/dkms/nvidia/$version/build/make.log"
+            exit 1
+        }
+        echo "DKMS reinstall succeeded."
+    fi
+
     update-initramfs -u
 
     if command -v nvidia-ctk &> /dev/null; then
+        echo
         echo "Reconfiguring NVIDIA Container Toolkit for Docker..."
         nvidia-ctk runtime configure --runtime=docker
         prompt_restart_docker
         echo "NVIDIA Container Toolkit reconfigured."
     fi
 
-    echo "Rebuild complete. Reboot your system to apply changes: sudo reboot"
+    echo "Rebuild complete."
     echo "After reboot, verify with: sudo bash $0 --status"
     prompt_reboot
 }
+ 
 
 case "$1" in
   --status)
